@@ -1,0 +1,304 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>atchat — minimal demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  fieldset { margin-bottom: 1rem; }
+  label { display: block; margin: 0.4rem 0 0.1rem; font-size: 0.85rem; color: #444; }
+  input { width: 100%; box-sizing: border-box; padding: 0.4rem; }
+  button { margin-top: 0.6rem; margin-right: 0.4rem; padding: 0.4rem 0.9rem; cursor: pointer; }
+  #status { font-weight: bold; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #999; margin-right: 6px; }
+  .dot.green { background: #2ecc71; }
+  .dot.yellow { background: #f1c40f; }
+  .dot.red { background: #e74c3c; }
+  #log { border: 1px solid #ccc; height: 220px; overflow-y: auto; padding: 0.5rem; margin-top: 0.5rem; font-size: 0.9rem; background: #fafafa; }
+  #log div { margin-bottom: 0.3rem; }
+  #msgRow { display: flex; gap: 0.4rem; margin-top: 0.5rem; }
+  #msgRow input { flex: 1; }
+  small.hint { color: #777; }
+</style>
+</head>
+<body>
+
+<h2>atchat — minimal demo</h2>
+<p><small class="hint">WebRTC datachannel text chat. atproto is used only to exchange the SDP offer/answer — the chat itself never touches your PDS. No encryption of the signaling payload in this v0; DTLS already encrypts the datachannel itself.</small></p>
+
+<fieldset>
+  <legend>Login</legend>
+  <label>My handle (e.g. alice.bsky.social)</label>
+  <input id="myHandle" autocomplete="off">
+  <label>My app password</label>
+  <input id="myPassword" type="password" autocomplete="off">
+  <label>Peer's handle</label>
+  <input id="peerHandle" autocomplete="off">
+  <button id="loginBtn">Log in</button>
+  <div id="loginStatus"><small class="hint">not logged in</small></div>
+</fieldset>
+
+<fieldset id="callControls" disabled>
+  <legend>Connect</legend>
+  <span class="dot red" id="dot"></span><span id="status">disconnected</span>
+  <div>
+    <button id="callBtn">Call peer</button>
+    <button id="waitBtn">Wait for call</button>
+    <button id="disconnectBtn">Disconnect / cleanup</button>
+  </div>
+</fieldset>
+
+<div id="log"></div>
+<div id="msgRow">
+  <input id="msgInput" placeholder="type a message…" disabled>
+  <button id="sendBtn" disabled>Send</button>
+</div>
+
+<script>
+const COLLECTION_OFFER = "com.demo.chat.offer";
+const COLLECTION_ANSWER = "com.demo.chat.answer";
+const RKEY = "self"; // fixed rkey — each new write overwrites the last, no accumulation
+const POLL_MS = 1500;
+const POLL_TIMEOUT_MS = 60000;
+
+let me = null;      // { handle, did, pds, jwt }
+let peer = null;    // { handle, did, pds }
+let pc = null;
+let dc = null;
+let pollTimer = null;
+let pollDeadline = null;
+
+const $ = id => document.getElementById(id);
+function log(msg) {
+  const d = document.createElement("div");
+  d.textContent = msg;
+  $("log").appendChild(d);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+function setStatus(text, color) {
+  $("status").textContent = text;
+  $("dot").className = "dot " + color;
+}
+
+// ---- atproto helpers ----
+
+async function resolveHandle(handle) {
+  const r = await fetch(`https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle=${encodeURIComponent(handle)}`);
+  if (!r.ok) throw new Error(`could not resolve handle ${handle}`);
+  const { did } = await r.json();
+  let pds;
+  if (did.startsWith("did:plc:")) {
+    const doc = await fetch(`https://plc.directory/${did}`).then(x => x.json());
+    pds = doc.service.find(s => s.id === "#atproto_pds").serviceEndpoint;
+  } else if (did.startsWith("did:web:")) {
+    const domain = did.slice("did:web:".length);
+    const doc = await fetch(`https://${domain}/.well-known/did.json`).then(x => x.json());
+    pds = doc.service.find(s => s.id === "#atproto_pds").serviceEndpoint;
+  } else {
+    throw new Error(`unsupported DID method for ${did}`);
+  }
+  return { did, pds };
+}
+
+async function login(handle, password) {
+  const { did, pds } = await resolveHandle(handle);
+  const r = await fetch(`${pds}/xrpc/com.atproto.server.createSession`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ identifier: handle, password })
+  });
+  if (!r.ok) throw new Error("login failed — check handle/app password");
+  const session = await r.json();
+  return { handle, did, pds, jwt: session.accessJwt };
+}
+
+async function putRecord(collection, record) {
+  const r = await fetch(`${me.pds}/xrpc/com.atproto.repo.putRecord`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${me.jwt}` },
+    body: JSON.stringify({ repo: me.did, collection, rkey: RKEY, record })
+  });
+  if (!r.ok) throw new Error(`putRecord ${collection} failed: ${await r.text()}`);
+}
+
+async function getRecord(pds, did, collection) {
+  const r = await fetch(`${pds}/xrpc/com.atproto.repo.getRecord?repo=${did}&collection=${collection}&rkey=${RKEY}`);
+  if (r.status === 400 || r.status === 404) return null;
+  if (!r.ok) throw new Error(`getRecord ${collection} failed`);
+  return (await r.json()).value;
+}
+
+async function deleteRecord(collection) {
+  await fetch(`${me.pds}/xrpc/com.atproto.repo.deleteRecord`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${me.jwt}` },
+    body: JSON.stringify({ repo: me.did, collection, rkey: RKEY })
+  }).catch(() => {}); // best-effort cleanup
+}
+
+// ---- WebRTC ----
+
+function waitIceComplete(pconn) {
+  if (pconn.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise(resolve => {
+    pconn.addEventListener("icegatheringstatechange", function h() {
+      if (pconn.iceGatheringState === "complete") {
+        pconn.removeEventListener("icegatheringstatechange", h);
+        resolve();
+      }
+    });
+  });
+}
+
+function newPeerConnection() {
+  const p = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+  p.onconnectionstatechange = () => {
+    log(`connection state: ${p.connectionState}`);
+    if (p.connectionState === "connected") setStatus("connected", "green");
+    else if (p.connectionState === "connecting") setStatus("connecting…", "yellow");
+    else if (["disconnected", "failed", "closed"].includes(p.connectionState)) setStatus("disconnected", "red");
+  };
+  return p;
+}
+
+function wireDataChannel(channel) {
+  dc = channel;
+  dc.onopen = () => {
+    log("data channel open");
+    $("msgInput").disabled = false;
+    $("sendBtn").disabled = false;
+    stopPolling();
+  };
+  dc.onclose = () => {
+    log("data channel closed");
+    $("msgInput").disabled = true;
+    $("sendBtn").disabled = true;
+  };
+  dc.onmessage = e => log(`peer: ${e.data}`);
+}
+
+function stopPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+async function callPeer() {
+  pc = newPeerConnection();
+  wireDataChannel(pc.createDataChannel("chat"));
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitIceComplete(pc);
+
+  await putRecord(COLLECTION_OFFER, {
+    $type: COLLECTION_OFFER,
+    to: peer.did,
+    from: me.did,
+    sdp: pc.localDescription,
+    createdAt: new Date().toISOString()
+  });
+  log("offer published — waiting for answer…");
+  setStatus("waiting for answer…", "yellow");
+
+  pollDeadline = Date.now() + POLL_TIMEOUT_MS;
+  pollTimer = setInterval(async () => {
+    if (Date.now() > pollDeadline) {
+      stopPolling();
+      log("no answer within timeout — cleaning up offer");
+      setStatus("disconnected", "red");
+      await deleteRecord(COLLECTION_OFFER);
+      return;
+    }
+    try {
+      const answer = await getRecord(peer.pds, peer.did, COLLECTION_ANSWER);
+      if (answer && answer.to === me.did) {
+        stopPolling();
+        await pc.setRemoteDescription(answer.sdp);
+        log("answer received — connecting…");
+        await deleteRecord(COLLECTION_OFFER); // handshake done, clean up our own outbox slot
+      }
+    } catch (e) { /* peer hasn't answered yet — keep polling */ }
+  }, POLL_MS);
+}
+
+async function waitForCall() {
+  setStatus("listening for offer…", "yellow");
+  log("polling peer for an offer…");
+
+  pollDeadline = Date.now() + POLL_TIMEOUT_MS;
+  pollTimer = setInterval(async () => {
+    if (Date.now() > pollDeadline) {
+      stopPolling();
+      log("no offer within timeout");
+      setStatus("disconnected", "red");
+      return;
+    }
+    try {
+      const offer = await getRecord(peer.pds, peer.did, COLLECTION_OFFER);
+      if (offer && offer.to === me.did) {
+        stopPolling();
+        log("offer received — answering…");
+
+        pc = newPeerConnection();
+        pc.ondatachannel = e => wireDataChannel(e.channel);
+
+        await pc.setRemoteDescription(offer.sdp);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await waitIceComplete(pc);
+
+        await putRecord(COLLECTION_ANSWER, {
+          $type: COLLECTION_ANSWER,
+          to: me.did === offer.from ? offer.from : offer.from, // reply to caller
+          from: me.did,
+          sdp: pc.localDescription,
+          createdAt: new Date().toISOString()
+        });
+        log("answer published — connecting…");
+      }
+    } catch (e) { /* caller hasn't offered yet — keep polling */ }
+  }, POLL_MS);
+}
+
+// ---- UI wiring ----
+
+$("loginBtn").onclick = async () => {
+  try {
+    $("loginStatus").innerHTML = "<small class='hint'>logging in…</small>";
+    const handle = $("myHandle").value.trim();
+    const password = $("myPassword").value;
+    const peerHandle = $("peerHandle").value.trim();
+    me = await login(handle, password);
+    peer = await resolveHandle(peerHandle);
+    peer.handle = peerHandle;
+    $("loginStatus").innerHTML = `<small class="hint">logged in as ${me.did} · peer resolved: ${peer.did}</small>`;
+    $("callControls").disabled = false;
+  } catch (e) {
+    $("loginStatus").innerHTML = `<small class="hint">error: ${e.message}</small>`;
+  }
+};
+
+$("callBtn").onclick = () => callPeer().catch(e => log("error: " + e.message));
+$("waitBtn").onclick = () => waitForCall().catch(e => log("error: " + e.message));
+
+$("disconnectBtn").onclick = async () => {
+  stopPolling();
+  if (pc) { pc.close(); pc = null; }
+  await deleteRecord(COLLECTION_OFFER);
+  await deleteRecord(COLLECTION_ANSWER);
+  setStatus("disconnected", "red");
+  log("cleaned up own offer/answer records and closed connection");
+};
+
+$("sendBtn").onclick = () => {
+  const val = $("msgInput").value;
+  if (val && dc && dc.readyState === "open") {
+    dc.send(val);
+    log(`me: ${val}`);
+    $("msgInput").value = "";
+  }
+};
+$("msgInput").addEventListener("keydown", e => { if (e.key === "Enter") $("sendBtn").click(); });
+</script>
+</body>
+</html>
